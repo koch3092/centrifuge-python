@@ -16,15 +16,15 @@ class CBQueue:
         while True:
             cb: Dict = await self.queue.get()
             if cb is None:
-                continue
+                return
             await cb["fn"]()
             self.queue.task_done()
 
     async def push(self, f: Callable):
         await self.queue.put({"fn": f, "tm": time.time()})
 
-    def close(self):
-        asyncio.run_coroutine_threadsafe(self._close(), asyncio.get_event_loop())
+    async def close(self):
+        await asyncio.shield(self._close())
 
     async def _close(self):
         await self.queue.put(None)

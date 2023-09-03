@@ -5,9 +5,14 @@ from asyncio import Event, Queue
 from typing import Set
 
 import websockets
+from pydantic import Field
 from websockets.exceptions import ConnectionClosedError
 
-from centrifuge.codes import CONNECTING_TRANSPORT_CLOSED, DISCONNECT_BAD_PROTOCOL
+from centrifuge.codes import (
+    CONNECTING_TRANSPORT_CLOSED,
+    DISCONNECT_BAD_PROTOCOL,
+    DISCONNECT_MESSAGE_SIZE_LIMIT,
+)
 from centrifuge.encode import (
     CommandEncoder,
     JSONCommandEncoder,
@@ -67,7 +72,7 @@ class WebsocketTransport(Transport):
             "reply_decoder", JSONReplyDecoder()
         )
         self._reply_msg: Queue = kwargs.get("reply_msg", Queue())
-        self._disconnect: Queue = kwargs.get("disconnect", Queue(1))
+        self._disconnect: DisconnectState = Field(None)
         self._closed: bool = kwargs.get("closed", False)
         self._close_event: asyncio.Event = kwargs.get("close_event", Event())
 
@@ -86,11 +91,7 @@ class WebsocketTransport(Transport):
         reply: Reply = await self._reply_msg.get()
         self._reply_msg.task_done()
         if reply is None:
-            return None, DisconnectState(
-                code=CONNECTING_TRANSPORT_CLOSED,
-                reconnect=True,
-                reason="transport closed",
-            )
+            return None, self._disconnect
         return reply, None
 
     async def write(self, cmd: Command, timeout: int = None):
@@ -106,38 +107,42 @@ class WebsocketTransport(Transport):
         await self._conn.close()
 
     async def _reader(self):
-        async for message in self._conn:
-            try:
+        try:
+            async for message in self._conn:
                 reply = self._reply_decoder.decode(message)
                 await self._reply_msg.put(reply)
-            except ConnectionClosedError:
-                await self.close()
-                break
-            except ValueError:
-                await self._disconnect.put(
-                    DisconnectState(
-                        reconnect=False,
-                        code=DISCONNECT_BAD_PROTOCOL,
-                        reason="decode error",
-                    )
+        except ValueError:
+            async with asyncio.Lock():
+                self._disconnect = DisconnectState(
+                    reconnect=False,
+                    code=DISCONNECT_BAD_PROTOCOL,
+                    reason="decode error",
                 )
-                return
-
-        code = CONNECTING_TRANSPORT_CLOSED
-        reason = ""
-        reconnect = True
-        if self._conn.close_reason:
-            try:
-                data = json.loads(self._conn.close_reason)
-            except ValueError:
-                pass
-            else:
-                reconnect = data.get("reconnect", True)
-                reason = data.get("reason", "")
-
-        await self._disconnect.put(
-            DisconnectState(code=code, reconnect=reconnect, reason=reason)
-        )
+        except ConnectionClosedError as e:
+            async with asyncio.Lock():
+                self._disconnect = extract_disconnect_websocket(e)
+        finally:
+            await asyncio.shield(self.close())
 
     async def _write_data(self, data: bytes, timeout: int = 0):
         await asyncio.wait_for(self._conn.send(data), timeout=timeout)
+
+
+def extract_disconnect_websocket(e: ConnectionClosedError) -> DisconnectState:
+    try:
+        d = json.loads(e.reason)
+    except ValueError:
+        code = e.code
+        reason = e.reason
+        reconnect = code < 3500 or code >= 5000 or (4000 <= code < 4500)
+        if code < 3000:
+            if code == 1009:
+                code = DISCONNECT_MESSAGE_SIZE_LIMIT
+            else:
+                # We expose codes defined by Centrifuge protocol, hiding details about transport-specific error codes.
+                # We may have extra optional transportCode field in the future.
+                code = CONNECTING_TRANSPORT_CLOSED
+
+        d = DisconnectState(code=code, reason=reason, reconnect=reconnect)
+
+    return d

@@ -1,4 +1,4 @@
-from typing import Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -69,4 +69,4 @@ class Reply(BaseModel, extra="allow"):
 
 
 class Request(BaseModel):
-    cb: Callable[[Optional[Reply], Optional[TransportError]], None]
+    cb: Callable[[Optional[Reply], Optional[TransportError]], Awaitable]

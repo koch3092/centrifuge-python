@@ -1,16 +1,11 @@
 import asyncio
 import random
-from asyncio import CancelledError, Event, Queue, TimerHandle
+from asyncio import CancelledError, Event, TimerHandle
 from typing import Callable, Dict, List, Optional, Set
 
 import websockets
 from pydantic import AnyUrl
-from websockets.exceptions import (
-    ConnectionClosedError,
-    InvalidHandshake,
-    InvalidURI,
-    WebSocketException,
-)
+from websockets.exceptions import ConnectionClosedError, WebSocketException
 
 from centrifuge.codes import (
     CONNECTING_CONNECT_CALLED,
@@ -70,9 +65,8 @@ class Client:
         self._refresh_required: bool = kwargs.get("refresh_required", False)
         self._delay: int = self.base_delay
         self._reconnect_timer: Optional[TimerHandle] = None
-        self._disconnect_event: asyncio.Event = kwargs.get("disconnect_event", Event())
-        self._disconnect: asyncio.Queue = kwargs.get("disconnect", Queue(1))
-        self._close_event: asyncio.Event = kwargs.get("close_event", Event())
+        self._disconnect_event: asyncio.Event = Event()
+        self._close_event: asyncio.Event = Event()
         self._loop = kwargs.get("loop", asyncio.get_event_loop())
         # @see https://docs.python.org/zh-cn/3.10/library/asyncio-task.html?highlight=discard#asyncio.create_task
         self._running_tasks: Set = set()
@@ -83,8 +77,6 @@ class Client:
             "on_error": kwargs.get("on_error"),
             "on_message": kwargs.get("on_message"),
         }
-
-        self._pong_count = 0
 
         self._check_handlers()
 
@@ -98,12 +90,13 @@ class Client:
             return
 
         if self._transport:
-            await self._transport.close()
+            await asyncio.shield(self._transport.close())
             self._transport = None
 
         prev_status = self._status
-        self._status = STATUS_DISCONNECTED
-        await self.clear_connected_state()
+        async with asyncio.Lock():
+            self._status = STATUS_DISCONNECTED
+            await self.clear_connected_state()
 
         if prev_status == STATUS_CONNECTED:
             pass
@@ -118,11 +111,12 @@ class Client:
             return
 
         if self._transport:
-            await self._transport.close()
+            await asyncio.shield(self._transport.close())
             self._transport = None
 
-        self._status = STATUS_CONNECTING
-        await self.clear_connected_state()
+        async with asyncio.Lock():
+            self._status = STATUS_CONNECTING
+            await self.clear_connected_state()
 
         handler = self._handlers.get("on_connect")
         if handler:
@@ -144,10 +138,11 @@ class Client:
         if self._status == STATUS_CLOSED:
             return
 
-        self._status = STATUS_CLOSED
+        async with asyncio.Lock():
+            self._status = STATUS_CLOSED
 
-        self._cb_queue.close()
-        self._cb_queue = None
+            await self._cb_queue.close()
+            self._cb_queue = None
 
     async def clear_connected_state(self):
         """
@@ -164,10 +159,14 @@ class Client:
         if self._close_event:
             self._close_event.clear()
 
+        if self._disconnect_event:
+            self._disconnect_event.clear()
+
         if self._requests:
             for req in self._requests.values():
                 if req.cb:
-                    await req.cb(None, ClientDisconnected)  # noqa
+                    self._run_task(req.cb, None, ClientDisconnected())
+            self._requests = {}
 
     def _exponential_backoff(self, delay: int):
         delay = min(delay * self.factor, self.max_delay)
@@ -225,16 +224,12 @@ class Client:
         return handler()
 
     async def _start_reconnecting(self):
-        async for websocket in websockets.connect(self.endpoint):
+        async with websockets.connect(self.endpoint) as websocket:
             try:
                 if self._status != STATUS_CONNECTING:
                     return
 
-                t = WebsocketTransport(
-                    conn=websocket,
-                    disconnect=self._disconnect,
-                    close_event=self._close_event,
-                )
+                t = WebsocketTransport(conn=websocket)
                 t.start_listener()
 
                 refresh_required = self._refresh_required
@@ -247,45 +242,42 @@ class Client:
                         return
                     async with asyncio.Lock():
                         self._token = token
-                        if self._status != STATUS_CONNECTING:
-                            return
+                    if self._status != STATUS_CONNECTING:
+                        return
                 if self._status != STATUS_CONNECTING:
-                    await t.close()
+                    await asyncio.shield(t.close())
                     return
                 self._refresh_required = False
                 self._transport = t
 
-                self._run_task(self._reader, t, self._disconnect_event)
+                self._run_task(self._reader, t)
 
                 await self._send_connect()
 
                 await self._close_event.wait()
             except WebSocketException as e:
-                err_msg = "Unknown websocket error."
-                if isinstance(e, InvalidURI):
-                    err_msg = "The address isn’t a valid WebSocket URI."
-                elif isinstance(e, InvalidHandshake):
-                    err_msg = "The opening handshake fails."
+                err_msg = "Unknown websocket error." if str(e) == "" else str(e)
                 await self._handle_error(ErrorEvent(error=err_msg))
                 return
-            except ConnectionClosedError:
-                err_msg = "No pong received from server."
-                await self._handle_error(ErrorEvent(error=err_msg))
-                continue
+            except ConnectionClosedError as e:
+                await self._handle_error(ErrorEvent(error=str(e)))
             except OSError:
                 err_msg = "The TCP connection fails."
                 await self._handle_error(ErrorEvent(error=err_msg))
                 return
-            except UnauthorizedError:
+            except UnauthorizedError as e:
+                await self._handle_error(RefreshEvent(error=str(e)))
                 if self._status != STATUS_CONNECTING:
+                    await asyncio.shield(t.close())
                     return
-                self._delay = self._exponential_backoff(self._delay)
-                self._reconnect_timer = self._set_timer(
-                    self._delay,
-                    self._run_task,
-                    self._start_reconnecting,
-                    timer=self._reconnect_timer,
-                )
+
+            self._delay = self._exponential_backoff(self._delay)
+            self._reconnect_timer = self._set_timer(
+                self._delay,
+                self._run_task,
+                self._start_reconnecting,
+                timer=self._reconnect_timer,
+            )
 
     async def _start_connecting(self):
         if self._status == STATUS_CLOSED:
@@ -381,7 +373,7 @@ class Client:
         try:
             token = await self._refresh_token()
         except UnauthorizedError as e:
-            await self._handle_refresh_error(RefreshEvent(error=e))
+            await self._handle_refresh_error(RefreshEvent(error=str(e)))
             return
 
         self._token = token
@@ -399,7 +391,7 @@ class Client:
 
         if err:
             await self._handle_error(ErrorEvent(error=str(err)))
-            await self._transport.close()
+            await asyncio.shield(self._transport.close())
             return
 
         if reply and reply.error:
@@ -407,7 +399,10 @@ class Client:
                 """
                 token expired
                 """
+                if self._status != STATUS_CONNECTING:
+                    return
                 self._refresh_required = True
+
                 self._delay = self._exponential_backoff(self._delay)
                 self._reconnect_timer = self._set_timer(
                     self._delay,
@@ -420,14 +415,6 @@ class Client:
                 """
                 temporary error
                 """
-                await self._move_to_disconnected(
-                    code=reply.error.code, reason=reply.error.message
-                )
-                return
-            else:
-                """
-                server error
-                """
                 if self._status != STATUS_CONNECTING:
                     return
 
@@ -439,11 +426,21 @@ class Client:
                     timer=self._reconnect_timer,
                 )
                 return
+            else:
+                """
+                server error
+                """
+                await self._move_to_disconnected(
+                    code=reply.error.code, reason=reply.error.message
+                )
+                return
 
         if self._status != STATUS_CONNECTING:
+            await asyncio.shield(self._transport.close())
             return
 
-        self._status = STATUS_CONNECTED
+        async with asyncio.Lock():
+            self._status = STATUS_CONNECTED
         res = reply.connect
         if res.expires:
             self._refresh_timer = self._set_timer(
@@ -504,6 +501,7 @@ class Client:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if self._disconnect_event.is_set():
+                self._disconnect_event.clear()
                 return
 
             if self._delay_ping.is_set():
@@ -524,9 +522,11 @@ class Client:
 
     async def _remove_request(self, req_id: int):
         async with asyncio.Lock():
-            del self._requests[req_id]
+            if self._requests.get(req_id):
+                del self._requests[req_id]
 
-    async def _read_once(self, t: WebsocketTransport):
+    async def _read_once(self, t: WebsocketTransport) -> (Reply, DisconnectState):
+        disconnect = None
         try:
             reply, disconnect = await t.read()
         except WebSocketException as e:
@@ -535,37 +535,36 @@ class Client:
                     code=CONNECTING_TRANSPORT_CLOSED, reason=str(e)
                 )
             )
-            return
+            return None, disconnect
 
         if reply is None:
             await self._handle_disconnect(disconnect=disconnect)
-            return
+            return None, disconnect
         await self._handle_reply(reply)
+        return reply, None
 
     async def _handle_reply(self, reply: Reply):
         if reply.id and int(reply.id) > 0:
             req = self._requests.get(reply.id)
             if req and req.cb:
-                await req.cb(reply, None)  # noqa
+                self._run_task(req.cb, reply, None)
             await self._remove_request(reply.id)
         else:
             if reply.push is None:
                 # Ping from server, send pong if needed
                 self._delay_ping.set()
                 if self._send_pong:
-                    self._pong_count += 1
                     await self._send(Command())
                 return
             if self._status != STATUS_CONNECTED:
                 return
 
-    async def _reader(self, t: WebsocketTransport, disconnect_event: Event):
+    async def _reader(self, t: WebsocketTransport):
         while True:
-            try:
-                await self._read_once(t)
-            except Exception:
-                disconnect_event.set()
+            _, disconnect = await self._read_once(t)
+            if disconnect:
                 break
+        self._disconnect_event.set()
 
     async def _run_handler(self, fn: Callable, e: CentrifugeEvent = None):
         async def _async_handler():
@@ -601,20 +600,25 @@ class Client:
     async def _send_async(self, cmd: Command, cb: Callable) -> None:
         await self._add_request(cmd.id, cb)
         await self._send(cmd)
-        done, pending = await asyncio.wait(
-            [self._close_event.wait()], timeout=self.config.read_timeout
-        )
 
-        req = self._requests.get(cmd.id)
-        if not req:
-            return
+        try:
+            await asyncio.wait_for(
+                self._close_event.wait(), timeout=self.config.read_timeout
+            )
+        except asyncio.TimeoutError:
+            req = self._requests.get(cmd.id)
+            if not req:
+                return
+            self._run_task(req.cb, None, Timeout())
+        finally:
+            if self._close_event.is_set():
+                self._close_event.clear()
+                req = self._requests.get(cmd.id)
+                if not req:
+                    return
+                self._run_task(req.cb, None, ClientDisconnected())
 
-        if self._close_event.wait in done:
-            self._close_event.clear()
-            await req.cb(None, ClientDisconnected())  # noqa
-            return
-
-        await req.cb(None, Timeout())  # noqa
+            await self._remove_request(cmd.id)
 
 
 class JsonClient(Client):
