@@ -1,10 +1,17 @@
-from typing import Callable, List
+from typing import Callable, List, Awaitable
 
 import websockets.datastructures
 
+from centrifuge.models.events import ConnectionTokenEvent
+
 
 class Config:
-    def __init__(self, token: str, get_token: Callable = None, **kwargs):
+    def __init__(
+        self,
+        token: str,
+        get_token: Callable[[ConnectionTokenEvent], Awaitable] = None,
+        **kwargs
+    ):
         """
         :param token: token for a connection authentication.
         :param get_token: get_token called to get or refresh connection token.
@@ -22,7 +29,7 @@ class Config:
         :param headers: headers specifies custom HTTP Header to send.
         """
         self.token = str(token)
-        self.get_token = get_token
+        self.get_token: Callable[[ConnectionTokenEvent], Awaitable] = get_token
         self.data: List[bytes] = kwargs.get("data", None)
         self.name: str = kwargs.get("name", "python")
         self.version: str = kwargs.get("version", "")

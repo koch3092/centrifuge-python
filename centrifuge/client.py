@@ -1,7 +1,7 @@
 import asyncio
 import random
 from asyncio import CancelledError, Event, TimerHandle
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Awaitable
 
 import websockets
 from pydantic import AnyUrl
@@ -15,6 +15,7 @@ from centrifuge.codes import (
     DISCONNECTED_UNAUTHORIZED,
 )
 from centrifuge.config import Config
+from centrifuge.models.client import Request, ServerSub, StreamPosition
 from centrifuge.models.command import Command, ConnectRequest, RefreshRequest
 from centrifuge.models.errors import (
     ClientClosed,
@@ -22,7 +23,6 @@ from centrifuge.models.errors import (
     ConfigurationError,
     Timeout,
     TransportError,
-    UnauthorizedError,
 )
 from centrifuge.models.events import (
     CentrifugeEvent,
@@ -31,8 +31,13 @@ from centrifuge.models.events import (
     DisconnectEvent,
     ErrorEvent,
     RefreshEvent,
+    ConnectionTokenEvent,
+    ServerSubscribedEvent,
+    ServerPublicationEvent,
+    ServerUnsubscribedEvent,
+    ServerSubscribingEvent,
 )
-from centrifuge.models.reply import Reply, Request
+from centrifuge.models.reply import Reply
 from centrifuge.models.transport import DisconnectState
 from centrifuge.queue import CBQueue
 from centrifuge.transport import WebsocketTransport
@@ -50,12 +55,13 @@ class Client:
     jitter = 0.5
 
     def __init__(self, endpoint: AnyUrl, config: Config, **kwargs):
+        self._cmd_id = 0
         self.endpoint: AnyUrl = endpoint
         self.config: Config = config
         self._token: str = self.config.token
         self._data: List[bytes] = self.config.data
         self._status: str = kwargs.get("status", STATUS_DISCONNECTED)
-        self._cmd_id = 0
+        self._server_subs: Dict[str, ServerSub] = {}
         self._delay_ping: Event = kwargs.get("delay_ping", Event())
         self._send_pong: bool = kwargs.get("send_pong", False)
         self._requests: Dict[int, Request] = kwargs.get("requests", {})
@@ -73,6 +79,10 @@ class Client:
         self._handlers: Dict[str, Callable] = {
             "on_connect": kwargs.get("on_connect"),
             "on_connected": kwargs.get("on_connected"),
+            "on_server_subscribed": kwargs.get("on_subscribed"),
+            "on_server_unsubscribed": kwargs.get("on_unsubscribed"),
+            "on_server_subscribing": kwargs.get("on_subscribing"),
+            "on_server_publication": kwargs.get("on_publication"),
             "on_disconnected": kwargs.get("on_disconnected"),
             "on_error": kwargs.get("on_error"),
             "on_message": kwargs.get("on_message"),
@@ -98,13 +108,24 @@ class Client:
             self._status = STATUS_DISCONNECTED
             await self.clear_connected_state()
 
+            server_subs_to_unsubscribe = self._server_subs.keys()
+
         if prev_status == STATUS_CONNECTED:
-            pass
+            server_subscribing_handler = self._handlers.get("on_server_subscribing")
+            if server_subscribing_handler:
+
+                async def _server_subscribing_handler():
+                    for ch in server_subs_to_unsubscribe:
+                        await server_subscribing_handler(
+                            ServerSubscribingEvent(channel=ch)
+                        )
+
+                await self._run_handler_async(_server_subscribing_handler)
 
         handler = self._handlers.get("on_disconnected")
         if handler:
             event = DisconnectEvent(code=code, reason=reason)
-            await self._run_handler(handler, event)
+            await self._run_handler_sync(handler, event)
 
     async def _move_to_connecting(self, code: int, reason: str):
         if self._status in (STATUS_CONNECTING, STATUS_CONNECTED, STATUS_CLOSED):
@@ -118,10 +139,21 @@ class Client:
             self._status = STATUS_CONNECTING
             await self.clear_connected_state()
 
+            server_subs_to_unsubscribe = self._server_subs.keys()
+
+        server_subscribing_handler = self._handlers.get("on_server_subscribing")
+        if server_subscribing_handler:
+
+            async def _server_subscribing_handler():
+                for ch in server_subs_to_unsubscribe:
+                    await server_subscribing_handler(ServerSubscribingEvent(channel=ch))
+
+            await self._run_handler_sync(_server_subscribing_handler)
+
         handler = self._handlers.get("on_connect")
         if handler:
             event = ConnectingEvent(code=code, reason=reason)
-            await self._run_handler(handler, event)
+            await self._run_handler_sync(handler, event)
 
         if self._status != STATUS_CONNECTING:
             return
@@ -141,6 +173,20 @@ class Client:
         async with asyncio.Lock():
             self._status = STATUS_CLOSED
 
+            server_subs_to_unsubscribe = self._server_subs.keys()
+
+        server_unsubscribed_handler = self._handlers.get("on_server_unsubscribed")
+        if server_unsubscribed_handler:
+
+            async def _server_unsubscribed_handler():
+                for ch in server_subs_to_unsubscribe:
+                    await server_unsubscribed_handler(
+                        ServerUnsubscribedEvent(channel=ch)
+                    )
+
+            await self._run_handler_async(_server_unsubscribed_handler)
+
+        async with asyncio.Lock():
             await self._cb_queue.close()
             self._cb_queue = None
 
@@ -203,7 +249,7 @@ class Client:
     async def _handle_error(self, e: ErrorEvent):
         handler = self._handlers.get("on_error")
         if handler:
-            await self._run_handler(handler, e)
+            await self._run_handler_sync(handler, e)
 
     async def _handle_disconnect(self, disconnect: DisconnectState = None):
         if not disconnect:
@@ -220,8 +266,10 @@ class Client:
     async def _refresh_token(self):
         handler = self.config.get_token
         if not handler:
-            raise UnauthorizedError("get_token muse be set to handle expired token")
-        return handler()
+            raise ConfigurationError("get_token muse be set to handle expired token")
+        if not asyncio.iscoroutinefunction(handler):
+            raise ConfigurationError("get_token must be coroutine function")
+        return await handler(ConnectionTokenEvent())
 
     async def _start_reconnecting(self):
         async with websockets.connect(self.endpoint) as websocket:
@@ -265,7 +313,7 @@ class Client:
                 err_msg = "The TCP connection fails."
                 await self._handle_error(ErrorEvent(error=err_msg))
                 return
-            except UnauthorizedError as e:
+            except ConfigurationError as e:
                 await self._handle_error(RefreshEvent(error=str(e)))
                 if self._status != STATUS_CONNECTING:
                     await asyncio.shield(t.close())
@@ -300,7 +348,7 @@ class Client:
             event = ConnectingEvent(
                 code=CONNECTING_CONNECT_CALLED, reason="connect called"
             )
-            await self._run_handler(handler, event)
+            await self._run_handler_sync(handler, event)
 
         await self._start_reconnecting()
 
@@ -372,7 +420,7 @@ class Client:
     async def _send_refresh(self):
         try:
             token = await self._refresh_token()
-        except UnauthorizedError as e:
+        except ConfigurationError as e:
             await self._handle_refresh_error(RefreshEvent(error=str(e)))
             return
 
@@ -452,7 +500,68 @@ class Client:
             event = ConnectedEvent(
                 client_id=res.client, version=res.version, data=res.data
             )
-            await self._run_handler(handler, event)
+            await self._run_handler_sync(handler, event)
+
+        subscribe_handler = self._handlers.get("on_server_subscribed")
+        publish_handler = self._handlers.get("on_server_publication")
+
+        for channel, sub_res in res.subs.items():
+            sub = self._server_subs.get(channel)
+            if sub:
+                sub.epoch = sub_res.epoch
+                sub.recoverable = sub_res.recoverable
+            else:
+                sub = ServerSub(
+                    offset=sub_res.offset,
+                    epoch=sub_res.epoch,
+                    recoverable=sub_res.recoverable,
+                )
+            if not sub_res.publications or len(sub_res.publications) == 0:
+                sub.offset = sub_res.offset
+            async with asyncio.Lock():
+                self._server_subs[channel] = sub
+
+            if subscribe_handler:
+                event = ServerSubscribedEvent(
+                    channel=channel,
+                    data=sub_res.data,
+                    recovered=sub_res.recovered,
+                    was_recovering=sub_res.was_recovering,
+                    positioned=sub_res.positioned,
+                    recoverable=sub_res.recoverable,
+                )
+                if event.positioned or event.recoverable:
+                    event.stream_position = StreamPosition(
+                        epoch=sub_res.epoch, offset=sub_res.offset
+                    )
+                await self._run_handler_sync(subscribe_handler, event)
+
+            if publish_handler:
+
+                async def _publish_handler():
+                    for pub in sub_res.publications:
+                        server_sub = self._server_subs.get(channel)
+                        if server_sub:
+                            server_sub.offset = pub.offset
+                        async with asyncio.Lock():
+                            self._server_subs[channel] = sub
+
+                        self._run_task(
+                            _publish_handler,
+                            ServerPublicationEvent(channel=channel, **pub.model_dump()),
+                        )
+
+                await self._run_handler_sync(_publish_handler)
+
+        for ch in self._server_subs:
+            if not res.subs.get(ch):
+                server_unsubscribed_handler = self._handlers.get(
+                    "on_server_unsubscribed"
+                )
+                if server_unsubscribed_handler:
+                    await self._run_handler_sync(
+                        server_unsubscribed_handler, ServerUnsubscribedEvent(channel=ch)
+                    )
 
         self._delay = self.base_delay
 
@@ -566,11 +675,23 @@ class Client:
                 break
         self._disconnect_event.set()
 
-    async def _run_handler(self, fn: Callable, e: CentrifugeEvent = None):
-        async def _async_handler():
-            return await fn(e)
+    async def _run_handler_sync(
+        self, fn: Callable[[CentrifugeEvent], Awaitable], e: CentrifugeEvent = None
+    ):
+        wait_event = Event()
+        wrapped = (
+            wrapper_with_event(fn, e, wait_event)
+            if e
+            else wrapper_without_event(fn, wait_event)
+        )
+        await self._cb_queue.push(wrapped)
+        await wait_event.wait()
 
-        await self._cb_queue.push(_async_handler)
+    async def _run_handler_async(
+        self, fn: Callable[[CentrifugeEvent], Awaitable], e: CentrifugeEvent = None
+    ):
+        wrapped = wrapper_with_event(fn, e) if e else wrapper_without_event(fn)
+        await self._cb_queue.push(wrapped)
 
     async def _send(self, cmd: Command):
         transport = self._transport
@@ -619,6 +740,31 @@ class Client:
                 self._run_task(req.cb, None, ClientDisconnected())
 
             await self._remove_request(cmd.id)
+
+
+def wrapper_with_event(
+    fn: Callable[[CentrifugeEvent], Awaitable],
+    e: CentrifugeEvent = None,
+    wait_event: Event = None,
+):
+    async def _wrapper():
+        if wait_event:
+            wait_event.set()
+        return await fn(e)
+
+    return _wrapper
+
+
+def wrapper_without_event(
+    fn: Callable[[], Awaitable],
+    wait_event: Event = None,
+):
+    async def _wrapper():
+        if wait_event:
+            wait_event.set()
+        return await fn()
+
+    return _wrapper
 
 
 class JsonClient(Client):

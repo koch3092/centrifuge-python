@@ -2,9 +2,52 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from centrifuge.models.client import StreamPosition
+from centrifuge.models.reply import Publication
+
 
 class CentrifugeEvent(BaseModel):
     pass
+
+
+class ConnectionTokenEvent(CentrifugeEvent):
+    """
+    ConnectionTokenEvent may contain some useful contextual information in the future.
+    For now, it's empty.
+    """
+
+    pass
+
+
+class SubscriptionTokenEvent(CentrifugeEvent):
+    """
+    SubscriptionTokenEvent contains info required to get subscription token when client wants to subscribe on private
+    channel.
+    """
+
+    channel: str
+
+
+class ServerPublicationEvent(CentrifugeEvent, Publication):
+    channel: str
+
+
+class ServerSubscribedEvent(CentrifugeEvent):
+    channel: str
+    was_recovering: bool
+    recovered: bool
+    recoverable: bool
+    positioned: bool
+    stream_position: Optional[StreamPosition] = Field(None)
+    data: Optional[bytes] = Field(None)
+
+
+class ServerUnsubscribedEvent(CentrifugeEvent):
+    channel: str
+
+
+class ServerSubscribingEvent(CentrifugeEvent):
+    channel: str
 
 
 class ConnectingEvent(CentrifugeEvent):

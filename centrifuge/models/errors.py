@@ -56,11 +56,3 @@ class WebsocketConnectError(CentrifugeException):
     """
 
     pass
-
-
-class UnauthorizedError(CentrifugeException):
-    """
-    UnauthorizedError raised by application from get_token function to indicate lack of operation permission.
-    """
-
-    pass

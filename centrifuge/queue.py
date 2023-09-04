@@ -12,12 +12,20 @@ class CBQueue:
         self._task.add(self.dispatch_task)
         self.dispatch_task.add_done_callback(self._task.discard)
 
+    def _run_task(self, coro, *args):
+        """
+        @see https://github.com/python/cpython/issues/91887
+        """
+        task = asyncio.create_task(coro(*args))
+        self._task.add(task)
+        task.add_done_callback(self._task.discard)
+
     async def dispatch(self):
         while True:
             cb: Dict = await self.queue.get()
             if cb is None:
                 return
-            await cb["fn"]()
+            self._run_task(cb["fn"])
             self.queue.task_done()
 
     async def push(self, f: Callable):
