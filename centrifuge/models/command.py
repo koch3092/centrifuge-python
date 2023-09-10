@@ -27,9 +27,15 @@ class RefreshRequest(BaseModel):
     token: Optional[str] = ""
 
 
+class PublishRequest(BaseModel):
+    channel: str = ""
+    data: Optional[bytes] = None
+
+
 class Command(BaseModel):
     id: Optional[int] = None
 
     connect: Optional[ConnectRequest] = None
     subscribe: Optional[SubscribeRequest] = None
     refresh: Optional[RefreshRequest] = None
+    publish: Optional[PublishRequest] = None

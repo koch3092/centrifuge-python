@@ -109,8 +109,9 @@ class WebsocketTransport(Transport):
     async def _reader(self):
         try:
             async for message in self._conn:
-                reply = self._reply_decoder.decode(message)
-                await self._reply_msg.put(reply)
+                replies = self._reply_decoder.decode(message)
+                for reply in replies:
+                    await self._reply_msg.put(reply)
         except ValueError:
             async with asyncio.Lock():
                 self._disconnect = DisconnectState(

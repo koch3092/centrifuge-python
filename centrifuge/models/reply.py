@@ -18,14 +18,18 @@ class ClientInfo(BaseModel):
     chan_info: str = Field(default=None, alias="chanInfo")
 
 
-class Publication(BaseModel):
+class CentrifugeResult(BaseModel):
+    pass
+
+
+class Publication(CentrifugeResult):
     data: str = Field(default=None)
     info: ClientInfo = Field(default=None)
     offset: int = Field(default=None)
-    tags: Dict[str, str] = Field(default=None)
+    tags: Optional[Dict[str, str]] = Field(default=None)
 
 
-class SubscribeResult(BaseModel):
+class SubscribeResult(CentrifugeResult):
     expires: bool = Field(default=False)
     ttl: int = Field(default=0)
     recoverable: bool = Field(default=False)
@@ -38,14 +42,14 @@ class SubscribeResult(BaseModel):
     was_recovering: bool = Field(default=False, alias="wasRecovering")
 
 
-class RefreshResult(BaseModel):
+class RefreshResult(CentrifugeResult):
     client: str = Field(default=None)
     version: str = Field(default=None)
     expires: bool = Field(default=None)
     ttl: int = Field(default=None)
 
 
-class ConnectResult(BaseModel):
+class ConnectResult(CentrifugeResult):
     client: str = None
     version: str = None
     expires: bool = None
@@ -58,6 +62,10 @@ class ConnectResult(BaseModel):
     node: Optional[str] = Field(None)
 
 
+class PublishResult(CentrifugeResult):
+    pass
+
+
 class Reply(BaseModel, extra="allow"):
     id: Optional[int] = Field(None)
     error: Optional[Error] = Field(None)
@@ -65,3 +73,5 @@ class Reply(BaseModel, extra="allow"):
     push: Optional[Push] = Field(None)
     connect: Optional[ConnectResult] = Field(None)
     refresh: Optional[RefreshResult] = Field(None)
+
+    publish: Optional[PublishResult] = Field(None)

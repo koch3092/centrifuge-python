@@ -14,7 +14,7 @@ class Publication(BaseModel):
     data: str = Field(default=None)
     info: ClientInfo = Field(default=None)
     offset: int = Field(default=None)
-    tags: Dict[str, str] = Field(default=None)
+    tags: Optional[Dict[str, str]] = Field(default=None)
 
 
 class Subscribe(BaseModel):
@@ -51,5 +51,8 @@ class Connect(BaseModel):
 
 
 class Push(BaseModel):
-    connect: Optional[Connect]
-    refresh: Optional[Refresh]
+    channel: str
+
+    pub: Optional[Publication] = None
+    connect: Optional[Connect] = None
+    refresh: Optional[Refresh] = None

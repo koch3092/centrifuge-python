@@ -25,10 +25,10 @@ class JSONCommandEncoder(CommandEncoder):
 
 class ReplyDecoder(ABC):
     @abstractmethod
-    def decode(self, reply: bytes) -> Reply:
+    def decode(self, message: bytes) -> List[Reply]:
         pass
 
 
 class JSONReplyDecoder(ReplyDecoder):
-    def decode(self, reply: bytes) -> Reply:
-        return Reply.model_validate_json(reply)
+    def decode(self, message: bytes) -> List[Reply]:
+        return [Reply.model_validate_json(reply) for reply in message.split("\n")]

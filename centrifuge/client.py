@@ -15,8 +15,13 @@ from centrifuge.codes import (
     DISCONNECTED_UNAUTHORIZED,
 )
 from centrifuge.config import Config
-from centrifuge.models.client import Request, ServerSub, StreamPosition
-from centrifuge.models.command import Command, ConnectRequest, RefreshRequest
+from centrifuge.models.client import Request, ServerSub, StreamPosition, ConnectFuture
+from centrifuge.models.command import (
+    Command,
+    ConnectRequest,
+    RefreshRequest,
+    PublishRequest,
+)
 from centrifuge.models.errors import (
     ClientClosed,
     ClientDisconnected,
@@ -37,7 +42,8 @@ from centrifuge.models.events import (
     ServerUnsubscribedEvent,
     ServerSubscribingEvent,
 )
-from centrifuge.models.reply import Reply
+from centrifuge.models.push import Push
+from centrifuge.models.reply import Reply, PublishResult
 from centrifuge.models.transport import DisconnectState
 from centrifuge.queue import CBQueue
 from centrifuge.transport import WebsocketTransport
@@ -55,6 +61,7 @@ class Client:
     jitter = 0.5
 
     def __init__(self, endpoint: AnyUrl, config: Config, **kwargs):
+        self._future_id = 0
         self._cmd_id = 0
         self.endpoint: AnyUrl = endpoint
         self.config: Config = config
@@ -73,6 +80,7 @@ class Client:
         self._reconnect_timer: Optional[TimerHandle] = None
         self._disconnect_event: asyncio.Event = Event()
         self._close_event: asyncio.Event = Event()
+        self._connect_futures: Dict[int, ConnectFuture] = {}
         self._loop = kwargs.get("loop", asyncio.get_event_loop())
         # @see https://docs.python.org/zh-cn/3.10/library/asyncio-task.html?highlight=discard#asyncio.create_task
         self._running_tasks: Set = set()
@@ -106,7 +114,8 @@ class Client:
         prev_status = self._status
         async with asyncio.Lock():
             self._status = STATUS_DISCONNECTED
-            await self.clear_connected_state()
+            await self._clear_connected_state()
+            await self._resolve_connect_futures(ClientDisconnected())
 
             server_subs_to_unsubscribe = self._server_subs.keys()
 
@@ -137,7 +146,8 @@ class Client:
 
         async with asyncio.Lock():
             self._status = STATUS_CONNECTING
-            await self.clear_connected_state()
+            await self._clear_connected_state()
+            await self._resolve_connect_futures(ClientDisconnected())
 
             server_subs_to_unsubscribe = self._server_subs.keys()
 
@@ -190,7 +200,7 @@ class Client:
             await self._cb_queue.close()
             self._cb_queue = None
 
-    async def clear_connected_state(self):
+    async def _clear_connected_state(self):
         """
         clear connected state such as timer
         """
@@ -301,6 +311,8 @@ class Client:
                 self._run_task(self._reader, t)
 
                 await self._send_connect()
+                async with asyncio.Lock():
+                    await self._resolve_connect_futures(None)
 
                 await self._close_event.wait()
             except WebSocketException as e:
@@ -389,6 +401,10 @@ class Client:
     def state(self):
         return self._status
 
+    def _next_future_id(self):
+        self._future_id += 1
+        return self._future_id
+
     def _next_cmd_id(self):
         self._cmd_id += 1
         return self._cmd_id
@@ -430,6 +446,20 @@ class Client:
         cmd.refresh = params
 
         await self._send_async(cmd, self._handle_refresh)
+
+    async def _send_publish(
+        self,
+        channel: str,
+        data: bytes,
+        queue: asyncio.Queue,
+    ):
+        cmd = Command(id=self._next_cmd_id())
+        cmd.publish = PublishRequest(channel=channel, data=data)
+
+        async def _handle_fn(reply: Optional[Reply], err: Optional[TransportError]):
+            await self._handle_publish(reply, err, queue)
+
+        await self._send_async(cmd, _handle_fn)
 
     async def _handle_connect(
         self, reply: Optional[Reply], err: Optional[TransportError]
@@ -601,6 +631,19 @@ class Client:
                 ttl, self._run_task, self._send_refresh, timer=self._refresh_timer
             )
 
+    async def _handle_publish(
+        self,
+        reply: Optional[Reply],
+        err: Optional[TransportError],
+        queue: asyncio.Queue,
+    ):
+        publish_result = PublishResult().model_dump_json()
+        if err:
+            await queue.put((publish_result, err))
+        if reply.error:
+            await queue.put((publish_result, TransportError(reply.error)))
+        await queue.put((publish_result, None))
+
     async def _wait_server_ping(self, ping_interval: int):
         timeout = self.config.max_server_ping_delay + ping_interval
         while not self._close_event.is_set():
@@ -667,6 +710,17 @@ class Client:
                 return
             if self._status != STATUS_CONNECTED:
                 return
+            await self._handle_push(reply.push)
+
+    async def _handle_push(self, push: Push):
+        if push.pub is not None:
+            channel = push.channel
+            publish_handler = self._handlers.get("on_server_publication")
+            if publish_handler:
+                await self._run_handler_sync(
+                    publish_handler,
+                    ServerPublicationEvent(channel=channel, **push.pub.model_dump()),
+                )
 
     async def _reader(self, t: WebsocketTransport):
         while True:
@@ -740,6 +794,60 @@ class Client:
                 self._run_task(req.cb, None, ClientDisconnected())
 
             await self._remove_request(cmd.id)
+
+    async def _resolve_connect_futures(self, err: Optional[TransportError] = None):
+        for future in self._connect_futures.values():
+            self._run_task(future.fn, None, err)
+        self._connect_futures = {}
+
+    async def _on_connect(self, fn: Callable[[Optional[TransportError]], Awaitable]):
+        if self._status == STATUS_CONNECTED:
+            await fn(None)
+            return
+        if self._status == STATUS_DISCONNECTED:
+            await fn(ClientDisconnected())
+            return
+
+        fut_id = self._next_future_id()
+        fut = ConnectFuture(fn=fn, close_event=Event())
+        async with asyncio.Lock():
+            self._connect_futures[fut_id] = fut
+
+        try:
+            await asyncio.wait_for(
+                fut.close_event.wait(), timeout=self.config.read_timeout
+            )
+        except asyncio.TimeoutError:
+            fut = self._connect_futures.get(fut_id)
+            if not fut:
+                return
+            async with asyncio.Lock():
+                del self._connect_futures[fut_id]
+            await fut.fn(Timeout())
+
+    async def publish(self, channel: str, data: str) -> (PublishResult, TransportError):
+        """
+        publish data to channel
+        """
+        if self._is_closed():
+            raise ClientClosed()
+
+        queue = asyncio.Queue()
+        await self._publish(channel, data.encode("utf-8"), queue)
+
+        result, err = await queue.get()
+        if err:
+            raise err
+        return result
+
+    async def _publish(self, channel: str, data: bytes, queue: asyncio.Queue):
+        async def _send_data(err: TransportError = None):
+            if err:
+                await self._handle_publish(Reply(publish=PublishResult()), err, queue)
+            else:
+                await self._send_publish(channel, data, queue)
+
+        await self._on_connect(_send_data)
 
 
 def wrapper_with_event(

@@ -19,3 +19,7 @@ class Request(BaseModel):
 class StreamPosition(BaseModel):
     offset: int
     epoch: str
+
+
+class ConnectFuture(BaseModel):
+    fn: Callable[[Optional[TransportError]], Awaitable]
