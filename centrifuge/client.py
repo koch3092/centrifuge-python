@@ -365,7 +365,7 @@ class Client:
         disconnect client from server. It's still possible to connect again later.
         If you don't need Client anymore – use Client.close.
         """
-        if self.is_close():
+        if self._is_closed():
             raise ClientClosed()
 
         await self._move_to_disconnected(
@@ -378,7 +378,7 @@ class Client:
         Use this method if you don't need client anymore, otherwise look at Client.disconnect.
         :return:
         """
-        if self.is_close():
+        if self._is_closed():
             return
 
         await self._move_to_disconnected(
@@ -396,7 +396,7 @@ class Client:
     def is_connected(self):
         return self._status == STATUS_CONNECTED
 
-    def is_close(self):
+    def _is_closed(self):
         return self._status == STATUS_CLOSED
 
     async def _send_connect(self) -> None:
