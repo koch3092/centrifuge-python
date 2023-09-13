@@ -833,7 +833,7 @@ class Client:
             raise ClientClosed()
 
         queue = asyncio.Queue()
-        await self._publish(channel, data.encode("utf-8"), queue)
+        self._run_task(self._publish, channel, data.encode("utf-8"), queue)
 
         result, err = await queue.get()
         if err:
