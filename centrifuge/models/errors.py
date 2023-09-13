@@ -56,3 +56,13 @@ class WebsocketConnectError(CentrifugeException):
     """
 
     pass
+
+
+class CentrifugeServerError(TransportError):
+    def __init__(self, code: int, message: str, temporary: bool = False):
+        self.code = code
+        self.message = message
+        self.temporary = temporary
+
+    def __str__(self):
+        return self.message

@@ -21,6 +21,7 @@ from centrifuge.models.command import (
     ConnectRequest,
     RefreshRequest,
     PublishRequest,
+    HistoryRequest,
 )
 from centrifuge.models.errors import (
     ClientClosed,
@@ -28,6 +29,7 @@ from centrifuge.models.errors import (
     ConfigurationError,
     Timeout,
     TransportError,
+    CentrifugeServerError,
 )
 from centrifuge.models.events import (
     CentrifugeEvent,
@@ -43,7 +45,8 @@ from centrifuge.models.events import (
     ServerSubscribingEvent,
 )
 from centrifuge.models.push import Push
-from centrifuge.models.reply import Reply, PublishResult
+from centrifuge.models.reply import Reply, PublishResult, HistoryResult
+from centrifuge.models.subscription import HistoryOptions
 from centrifuge.models.transport import DisconnectState
 from centrifuge.queue import CBQueue
 from centrifuge.transport import WebsocketTransport
@@ -640,8 +643,12 @@ class Client:
         publish_result = PublishResult().model_dump_json()
         if err:
             await queue.put((publish_result, err))
+            return
         if reply.error:
-            await queue.put((publish_result, TransportError(reply.error)))
+            await queue.put(
+                (publish_result, CentrifugeServerError(**reply.error.model_dump()))
+            )
+            return
         await queue.put((publish_result, None))
 
     async def _wait_server_ping(self, ping_interval: int):
@@ -825,7 +832,7 @@ class Client:
                 del self._connect_futures[fut_id]
             await fut.fn(Timeout())
 
-    async def publish(self, channel: str, data: str) -> (PublishResult, TransportError):
+    async def publish(self, channel: str, data: str) -> PublishResult:
         """
         publish data to channel
         """
