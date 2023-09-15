@@ -2,6 +2,8 @@ from typing import Dict, Optional
 
 from pydantic import BaseModel
 
+from centrifuge.models.client import StreamPosition
+
 
 class SubscribeRequest(BaseModel):
     channel: str
@@ -32,6 +34,13 @@ class PublishRequest(BaseModel):
     data: Optional[bytes] = None
 
 
+class HistoryRequest(BaseModel):
+    channel: str = ""
+    limit: int = 0
+    since: Optional[StreamPosition] = None
+    reverse: bool = False
+
+
 class Command(BaseModel):
     id: Optional[int] = None
 
@@ -39,3 +48,4 @@ class Command(BaseModel):
     subscribe: Optional[SubscribeRequest] = None
     refresh: Optional[RefreshRequest] = None
     publish: Optional[PublishRequest] = None
+    history: Optional[HistoryRequest] = None

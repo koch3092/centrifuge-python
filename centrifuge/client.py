@@ -464,6 +464,19 @@ class Client:
 
         await self._send_async(cmd, _handle_fn)
 
+    async def _send_history(self, channel: str, opts: HistoryOptions, queue: asyncio.Queue):
+        params = HistoryRequest(channel=channel, limit=opts.limit, reverse=opts.reverse)
+        if opts.since is not None:
+            params.since = StreamPosition(offset=opts.since.offset, epoch=opts.since.epoch)
+
+        cmd = Command(id=self._next_cmd_id())
+        cmd.history = params
+
+        async def _handle_fn(reply: Optional[Reply], err: Optional[TransportError]):
+            await self._handle_history(reply, err, queue)
+
+        await self._send_async(cmd, _handle_fn)
+
     async def _handle_connect(
         self, reply: Optional[Reply], err: Optional[TransportError]
     ):
@@ -650,6 +663,23 @@ class Client:
             )
             return
         await queue.put((publish_result, None))
+
+    async def _handle_history(
+        self,
+        reply: Optional[Reply],
+        err: Optional[TransportError],
+        queue: asyncio.Queue,
+    ):
+        history_result = HistoryResult().model_dump_json()
+        if err:
+            await queue.put((history_result, err))
+            return
+        if reply.error:
+            await queue.put(
+                (history_result, CentrifugeServerError(**reply.error.model_dump()))
+            )
+            return
+        await queue.put((reply.history.model_dump_json(), None))
 
     async def _wait_server_ping(self, ping_interval: int):
         timeout = self.config.max_server_ping_delay + ping_interval
@@ -853,6 +883,27 @@ class Client:
                 await self._handle_publish(Reply(publish=PublishResult()), err, queue)
             else:
                 await self._send_publish(channel, data, queue)
+
+        await self._on_connect(_send_data)
+
+    async def history(self, channel: str, opts: HistoryOptions) -> HistoryResult:
+        if self._is_closed():
+            raise ClientClosed()
+
+        queue = asyncio.Queue()
+        self._run_task(self._history, channel, opts, queue)
+
+        result, err = await queue.get()
+        if err:
+            raise err
+        return result
+
+    async def _history(self, channel: str, opts: HistoryOptions, queue: asyncio.Queue):
+        async def _send_data(err: TransportError = None):
+            if err:
+                await self._handle_history(Reply(history=HistoryResult()), err, queue)
+            else:
+                await self._send_history(channel, opts, queue)
 
         await self._on_connect(_send_data)
 

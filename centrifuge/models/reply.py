@@ -8,7 +8,7 @@ from centrifuge.models.push import Push
 class Error(BaseModel):
     code: int = None
     message: str = None
-    temporary: Optional[bool]
+    temporary: Optional[bool] = Field(False)
 
 
 class ClientInfo(BaseModel):
@@ -66,6 +66,12 @@ class PublishResult(CentrifugeResult):
     pass
 
 
+class HistoryResult(CentrifugeResult):
+    publications: List[Publication] = Field(default=[])
+    offset: int = Field(default=0)
+    epoch: str = Field(default="")
+
+
 class Reply(BaseModel, extra="allow"):
     id: Optional[int] = Field(None)
     error: Optional[Error] = Field(None)
@@ -75,3 +81,4 @@ class Reply(BaseModel, extra="allow"):
     refresh: Optional[RefreshResult] = Field(None)
 
     publish: Optional[PublishResult] = Field(None)
+    history: Optional[HistoryResult] = Field(None)
