@@ -15,9 +15,7 @@ class JSONCommandEncoder(CommandEncoder):
     def encode(self, commands: List[Command]) -> bytes:
         return "\n".join(
             [
-                command.model_dump_json(
-                    exclude_none=True, exclude_unset=True, exclude_defaults=True
-                )
+                command.model_dump_json(exclude_none=True, exclude_unset=True)
                 for command in commands
             ]
         ).encode("utf-8")
