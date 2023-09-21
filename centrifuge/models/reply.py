@@ -72,6 +72,19 @@ class HistoryResult(CentrifugeResult):
     epoch: str = Field(default="")
 
 
+class PresenceResult(CentrifugeResult):
+    clients: Dict[str, ClientInfo] = Field(default={})
+
+
+class PresenceStats(BaseModel):
+    num_clients: int = 0
+    num_users: int = 0
+
+
+class PresenceStatsResult(BaseModel):
+    presence_stats: PresenceStats = Field(default=None, alias="presenceStats")
+
+
 class Reply(BaseModel, extra="allow"):
     id: Optional[int] = Field(None)
     error: Optional[Error] = Field(None)
@@ -82,3 +95,5 @@ class Reply(BaseModel, extra="allow"):
 
     publish: Optional[PublishResult] = Field(None)
     history: Optional[HistoryResult] = Field(None)
+    presence: Optional[PresenceResult] = Field(None)
+    presence_stats: Optional[PresenceStatsResult] = Field(None)

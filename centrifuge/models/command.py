@@ -41,6 +41,14 @@ class HistoryRequest(BaseModel):
     reverse: bool = False
 
 
+class PresenceRequest(BaseModel):
+    channel: str = ""
+
+
+class PresenceStatsRequest(BaseModel):
+    channel: str = ""
+
+
 class Command(BaseModel):
     id: Optional[int] = None
 
@@ -49,3 +57,5 @@ class Command(BaseModel):
     refresh: Optional[RefreshRequest] = None
     publish: Optional[PublishRequest] = None
     history: Optional[HistoryRequest] = None
+    presence: Optional[PresenceRequest] = None
+    presence_stats: Optional[PresenceStatsRequest] = None

@@ -22,6 +22,8 @@ from centrifuge.models.command import (
     RefreshRequest,
     PublishRequest,
     HistoryRequest,
+    PresenceRequest,
+    PresenceStatsRequest,
 )
 from centrifuge.models.errors import (
     ClientClosed,
@@ -45,7 +47,13 @@ from centrifuge.models.events import (
     ServerSubscribingEvent,
 )
 from centrifuge.models.push import Push
-from centrifuge.models.reply import Reply, PublishResult, HistoryResult
+from centrifuge.models.reply import (
+    Reply,
+    PublishResult,
+    HistoryResult,
+    PresenceResult,
+    PresenceStatsResult,
+)
 from centrifuge.models.subscription import HistoryOptions
 from centrifuge.models.transport import DisconnectState
 from centrifuge.queue import CBQueue
@@ -464,16 +472,40 @@ class Client:
 
         await self._send_async(cmd, _handle_fn)
 
-    async def _send_history(self, channel: str, opts: HistoryOptions, queue: asyncio.Queue):
+    async def _send_history(
+        self, channel: str, opts: HistoryOptions, queue: asyncio.Queue
+    ):
         params = HistoryRequest(channel=channel, limit=opts.limit, reverse=opts.reverse)
         if opts.since is not None:
-            params.since = StreamPosition(offset=opts.since.offset, epoch=opts.since.epoch)
+            params.since = StreamPosition(
+                offset=opts.since.offset, epoch=opts.since.epoch
+            )
 
         cmd = Command(id=self._next_cmd_id())
         cmd.history = params
 
         async def _handle_fn(reply: Optional[Reply], err: Optional[TransportError]):
             await self._handle_history(reply, err, queue)
+
+        await self._send_async(cmd, _handle_fn)
+
+    async def _send_presence(self, channel: str, queue: asyncio.Queue):
+        params = PresenceRequest(channel=channel)
+        cmd = Command(id=self._next_cmd_id())
+        cmd.presence = params
+
+        async def _handle_fn(reply: Optional[Reply], err: Optional[TransportError]):
+            await self._handle_presence(reply, err, queue)
+
+        await self._send_async(cmd, _handle_fn)
+
+    async def _send_presence_stats(self, channel: str, queue: asyncio.Queue):
+        params = PresenceStatsRequest(channel=channel)
+        cmd = Command(id=self._next_cmd_id())
+        cmd.presence = params
+
+        async def _handle_fn(reply: Optional[Reply], err: Optional[TransportError]):
+            await self._handle_presence_stats(reply, err, queue)
 
         await self._send_async(cmd, _handle_fn)
 
@@ -680,6 +712,43 @@ class Client:
             )
             return
         await queue.put((reply.history.model_dump_json(), None))
+
+    async def _handle_presence(
+        self,
+        reply: Optional[Reply],
+        err: Optional[TransportError],
+        queue: asyncio.Queue,
+    ):
+        presence_result = PresenceResult().model_dump_json()
+        if err:
+            await queue.put((presence_result, err))
+            return
+        if reply.error:
+            await queue.put(
+                (presence_result, CentrifugeServerError(**reply.error.model_dump()))
+            )
+            return
+        await queue.put((reply.presence.model_dump_json(), None))
+
+    async def _handle_presence_stats(
+        self,
+        reply: Optional[Reply],
+        err: Optional[TransportError],
+        queue: asyncio.Queue,
+    ):
+        presence_stats_result = PresenceStatsResult().model_dump_json()
+        if err:
+            await queue.put((presence_stats_result, err))
+            return
+        if reply.error:
+            await queue.put(
+                (
+                    presence_stats_result,
+                    CentrifugeServerError(**reply.error.model_dump()),
+                )
+            )
+            return
+        await queue.put((reply.presence_stats.model_dump_json(), None))
 
     async def _wait_server_ping(self, ping_interval: int):
         timeout = self.config.max_server_ping_delay + ping_interval
@@ -904,6 +973,52 @@ class Client:
                 await self._handle_history(Reply(history=HistoryResult()), err, queue)
             else:
                 await self._send_history(channel, opts, queue)
+
+        await self._on_connect(_send_data)
+
+    async def presence(self, channel: str) -> PresenceResult:
+        if self._is_closed():
+            raise ClientClosed()
+
+        queue = asyncio.Queue()
+        self._run_task(self._presence, channel, queue)
+
+        result, err = await queue.get()
+        if err:
+            raise err
+        return result
+
+    async def _presence(self, channel: str, queue: asyncio.Queue):
+        async def _send_data(err: TransportError = None):
+            if err:
+                await self._handle_presence(
+                    Reply(presence=PresenceResult()), err, queue
+                )
+            else:
+                await self._send_presence(channel, queue)
+
+        await self._on_connect(_send_data)
+
+    async def presence_stats(self, channel: str) -> PresenceResult:
+        if self._is_closed():
+            raise ClientClosed()
+
+        queue = asyncio.Queue()
+        self._run_task(self._presence_stats, channel, queue)
+
+        result, err = await queue.get()
+        if err:
+            raise err
+        return result
+
+    async def _presence_stats(self, channel: str, queue: asyncio.Queue):
+        async def _send_data(err: TransportError = None):
+            if err:
+                await self._handle_presence_stats(
+                    Reply(presence_stats=PresenceStatsResult()), err, queue
+                )
+            else:
+                await self._send_presence_stats(channel, queue)
 
         await self._on_connect(_send_data)
 
